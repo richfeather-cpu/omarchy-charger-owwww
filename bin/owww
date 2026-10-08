@@ -18,6 +18,7 @@
 #   OWWW_POWER_SUPPLY     sysfs power_supply directory (default: /sys/class/power_supply)
 #   OWWW_DRYRUN=1         print the sound path instead of playing
 #   OWWW_NO_UDEV=1        do not start udevadm; poll only
+#   OWWW_NO_PDEATHSIG=1   do not use setpriv --pdeathsig; poll the parent pid
 
 set -u
 set -o pipefail
@@ -326,13 +327,28 @@ simulate() {
     done
 }
 
+# Quickshell's Process sends SIGTERM to this pid only when `running` is set
+# false (QProcess::terminate) and SIGKILL when the object is destroyed
+# (QProcess::kill). Neither reaches children. A trap also cannot run after
+# SIGKILL, which is how a reload orphans `udevadm monitor` while this shell
+# is blocked in `read -t`. setpriv --pdeathsig TERM asks the kernel to signal
+# the child when this process dies. Without setpriv, a watchdog polls our pid.
 cleanup() {
-    local pid="${udev_pid:-}"
+    local pid="${udev_pid:-}" pgid="" rest
     udev_pid=""
-    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
-        kill "$pid" 2>/dev/null || true
-        wait "$pid" 2>/dev/null || true
+    [[ -n "$pid" ]] || return 0
+    # Kill the child's process group only when it is the leader. Otherwise
+    # the group is the shell that launched us, and a group signal would hit it.
+    if [[ -r "/proc/${pid}/stat" ]]; then
+        rest=$(cat "/proc/${pid}/stat" 2>/dev/null || true)
+        rest=${rest#*) }
+        read -r _ _ pgid _ <<<"$rest"
     fi
+    if [[ -n "$pgid" && "$pgid" == "$pid" ]]; then
+        kill -TERM -- "-${pid}" 2>/dev/null || true
+    fi
+    kill -TERM -- "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
 }
 
 # SIGTERM is how the shell stops the watcher on disable. Exit cleanly so it
@@ -342,14 +358,83 @@ on_signal() {
     exit 0
 }
 
+# Fallback when setpriv is missing. This process is the direct child; it
+# kills udevadm when the watcher pid is gone, including after SIGKILL.
+udev_watchdog() {
+    local parent="$1" child="" sleeper=""
+    stop_child() {
+        if [[ -n "$sleeper" ]]; then
+            kill -TERM "$sleeper" 2>/dev/null || true
+            wait "$sleeper" 2>/dev/null || true
+            sleeper=""
+        fi
+        if [[ -n "$child" ]]; then
+            kill -TERM "$child" 2>/dev/null || true
+            wait "$child" 2>/dev/null || true
+            child=""
+        fi
+    }
+    trap 'stop_child; exit 0' INT TERM HUP EXIT
+    if [[ -z "$parent" ]] || ! kill -0 "$parent" 2>/dev/null; then
+        exit 0
+    fi
+    udevadm monitor --udev --subsystem-match=power_supply &
+    child=$!
+    while kill -0 "$parent" 2>/dev/null; do
+        if ! kill -0 "$child" 2>/dev/null; then
+            wait "$child"
+            exit $?
+        fi
+        # `wait` runs traps immediately, so a SIGTERM is not stuck behind sleep.
+        sleep 0.2 &
+        sleeper=$!
+        wait "$sleeper" 2>/dev/null || true
+        sleeper=""
+    done
+    stop_child
+    exit 0
+}
+
+# Replace this process with udevadm, armed so it dies with its parent.
+# setsid gives it a private process group when that will not fork (forking
+# would reparent it and fire pdeathsig immediately).
+exec_udev_with_pdeathsig() {
+    local parent="$1" pgrp="" rest
+    if [[ -r /proc/self/stat ]]; then
+        rest=$(cat /proc/self/stat 2>/dev/null || true)
+        rest=${rest#*) }
+        read -r _ _ pgrp _ <<<"$rest"
+    fi
+    if [[ -n "$pgrp" && "$pgrp" != "$BASHPID" ]] && command -v setsid >/dev/null 2>&1; then
+        exec setpriv --pdeathsig TERM -- bash -c \
+            'kill -0 "$1" 2>/dev/null || exit 0; shift; exec "$@"' \
+            _ "$parent" setsid udevadm monitor --udev --subsystem-match=power_supply
+    fi
+    exec setpriv --pdeathsig TERM -- bash -c \
+        'kill -0 "$1" 2>/dev/null || exit 0; shift; exec "$@"' \
+        _ "$parent" udevadm monitor --udev --subsystem-match=power_supply
+}
+
+start_udev() {
+    exec 3< <(
+        trap - INT TERM HUP EXIT
+        # $$ in this subshell is the watcher. $PPID is not: bash leaves it
+        # as the watcher's parent, so a pid check would never see us die.
+        parent=$$
+        if [[ "${OWWW_NO_PDEATHSIG:-0}" != 1 ]] && command -v setpriv >/dev/null 2>&1; then
+            exec_udev_with_pdeathsig "$parent"
+        fi
+        udev_watchdog "$parent"
+    )
+    udev_pid=$!
+}
+
 run_watcher() {
     local have_udev=0 line rc
-    trap on_signal INT TERM
+    trap on_signal INT TERM HUP
     trap cleanup EXIT
     if [[ "${OWWW_NO_UDEV:-0}" != 1 ]] && command -v udevadm >/dev/null 2>&1; then
-        # Keep udevadm's pid so disable/stop can reap it with this script.
-        exec 3< <(exec udevadm monitor --udev --subsystem-match=power_supply)
-        udev_pid=$!
+        start_udev
         have_udev=1
     elif [[ "${OWWW_NO_UDEV:-0}" != 1 ]]; then
         echo "owww: udevadm not found; polling every ${POLL}s" >&2
