@@ -435,63 +435,94 @@ set +e
 assert_eq "unknown flag exits 2" "$usage_rc" "2"
 
 # --- stop cleans up the udev child -----------------------------------------
+# Quickshell signals only the watcher pid: SIGTERM when Process.running is
+# cleared, SIGKILL when the Process object is destroyed. The fake udevadm is
+# one process (exec sleep) and must not survive either, including when bash
+# is blocked in read -t and cannot run a trap (SIGKILL).
 fakebin="$tmp/udev-bin"
 mkdir -p "$fakebin"
 cat > "$fakebin/udevadm" <<'EOF'
 #!/bin/bash
 printf '%s\n' "$$" > "$OWWW_UDEV_PIDFILE"
-sleep 30
+exec sleep 30
 EOF
 chmod +x "$fakebin/udevadm"
-pidfile="$tmp/udev.pid"
-rm -f "$pidfile"
-PATH="$fakebin:$PATH" \
-    OWWW_UDEV_PIDFILE="$pidfile" \
-    OWWW_SHELL_CONFIG="$tmp/empty.json" \
-    OWWW_PLUGIN_DIR="$ROOT" \
-    OWWW_POWER_SUPPLY="$tmp/missing-sysfs" \
-    "$ROOT/bin/owww" >"$tmp/watch.out" 2>"$tmp/watch.err" &
-watcher=$!
-started=0
-for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
-    if [[ -s "$pidfile" ]] && grep -q "AC online=0" "$tmp/watch.out" 2>/dev/null; then
-        started=1
-        break
+
+stop_udev_case() {
+    local signal="$1" label="$2" expect_zero="$3"
+    local pidfile="$tmp/udev-${signal}-${label}.pid"
+    local out="$tmp/watch-${signal}-${label}.out"
+    local err="$tmp/watch-${signal}-${label}.err"
+    local watcher started=0 stopped=0 stop_rc=0 udev="" alive=0 i
+    rm -f "$pidfile"
+    PATH="$fakebin:$PATH" \
+        OWWW_UDEV_PIDFILE="$pidfile" \
+        OWWW_NO_PDEATHSIG="${OWWW_NO_PDEATHSIG:-0}" \
+        OWWW_SHELL_CONFIG="$tmp/empty.json" \
+        OWWW_PLUGIN_DIR="$ROOT" \
+        OWWW_POWER_SUPPLY="$tmp/missing-sysfs" \
+        "$ROOT/bin/owww" >"$out" 2>"$err" &
+    watcher=$!
+    for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40; do
+        if [[ -s "$pidfile" ]] && grep -q "AC online=0" "$out" 2>/dev/null; then
+            started=1
+            break
+        fi
+        sleep 0.05
+    done
+    if (( started )); then
+        ok "$label udevadm monitor was started"
+    else
+        not_ok "$label udevadm monitor was started" "$(cat "$err" 2>/dev/null || true)"
     fi
-    sleep 0.05
-done
-if (( started )); then
-    ok "udevadm monitor was started"
-else
-    not_ok "udevadm monitor was started" "$(cat "$tmp/watch.err" 2>/dev/null || true)"
-fi
-kill -TERM "$watcher" 2>/dev/null || true
-stopped=0
-for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
-    if ! kill -0 "$watcher" 2>/dev/null; then
-        stopped=1
-        break
+    udev=$(cat "$pidfile" 2>/dev/null || true)
+    kill "-${signal}" "$watcher" 2>/dev/null || true
+    for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40; do
+        if ! kill -0 "$watcher" 2>/dev/null; then
+            stopped=1
+            break
+        fi
+        sleep 0.05
+    done
+    if (( stopped )); then
+        set +e
+        wait "$watcher" 2>/dev/null
+        stop_rc=$?
+        set +e
+        if (( expect_zero )); then
+            assert_eq "$label exits 0" "$stop_rc" "0"
+        else
+            ok "$label parent was killed"
+        fi
+    else
+        not_ok "$label parent was killed" "watcher still running"
+        kill -KILL "$watcher" 2>/dev/null || true
+        wait "$watcher" 2>/dev/null || true
     fi
-    sleep 0.05
-done
-if (( stopped )); then
-    set +e
-    wait "$watcher"
-    stop_rc=$?
-    set +e
-    assert_eq "SIGTERM exits 0" "$stop_rc" "0"
-else
-    not_ok "SIGTERM exits 0" "watcher still running"
-    kill -KILL "$watcher" 2>/dev/null || true
-    wait "$watcher" 2>/dev/null || true
-fi
-if [[ -s "$pidfile" ]] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then
-    not_ok "udevadm child was reaped" "pid $(cat "$pidfile") still running"
-    kill -KILL "$(cat "$pidfile")" 2>/dev/null || true
-else
-    ok "udevadm child was reaped"
-fi
-assert_contains "watcher logged the first AC reading" "$(cat "$tmp/watch.out")" "AC online=0"
+    alive=0
+    if [[ -n "$udev" ]]; then
+        for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40; do
+            if ! kill -0 "$udev" 2>/dev/null; then
+                alive=0
+                break
+            fi
+            alive=1
+            sleep 0.05
+        done
+    fi
+    if (( alive )); then
+        not_ok "$label leaves no udevadm child" "pid $udev still running"
+        kill -KILL "$udev" 2>/dev/null || true
+    else
+        ok "$label leaves no udevadm child"
+    fi
+    assert_contains "$label logged the first AC reading" "$(cat "$out" 2>/dev/null || true)" "AC online=0"
+}
+
+OWWW_NO_PDEATHSIG=0 stop_udev_case TERM "SIGTERM" 1
+OWWW_NO_PDEATHSIG=0 stop_udev_case KILL "SIGKILL" 0
+# Same kill, without setpriv, so the parent-pid watchdog has to reap the child.
+OWWW_NO_PDEATHSIG=1 stop_udev_case KILL "SIGKILL without setpriv" 0
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 if (( fail > 0 )); then
