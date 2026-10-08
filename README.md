@@ -9,7 +9,7 @@ Owww is an [Omarchy](https://omarchy.org) shell plugin. While it is enabled, the
 The plugin runs as unsandboxed code inside `omarchy-shell`. Read it before you turn it on.
 
 ```sh
-omarchy plugin add https://github.com/richfeather-cpu/omarchy-owww.git
+omarchy plugin add https://github.com/richfeather-cpu/omarchy-charger-owwww.git
 omarchy plugin enable io.github.richfeather-cpu.omarchy-owww
 ```
 
