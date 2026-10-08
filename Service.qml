@@ -12,8 +12,10 @@ Item {
     width: 0
     height: 0
 
-    // Injected by the shell after createObject. manifest.__sourceDir is how
-    // a third-party plugin finds its own scripts and the bundled sound.
+    // Injected by the shell after createObject. Third-party manifests arrive
+    // from publicPluginManifest, which deletes __sourceDir, so this file's
+    // own URL is where bin/owww and the bundled sound live. __sourceDir is
+    // only a fallback for a host that still passes it.
     property var shell: null
     property var manifest: null
     property var pluginRegistry: null
@@ -23,7 +25,24 @@ Item {
         ? String(manifest.id)
         : "io.github.richfeather-cpu.omarchy-owww"
 
+    // file:///path/to/plugin/ -> /path/to/plugin. Non-file URLs yield "".
+    function pathFromFileUrl(url) {
+        var text = String(url || "")
+        if (text.indexOf("file://") !== 0)
+            return ""
+        text = text.substring(7)
+        try {
+            text = decodeURIComponent(text)
+        } catch (e) {
+            // Malformed percent-encoding: keep the raw path.
+        }
+        return text.replace(/\/$/, "")
+    }
+
     readonly property string pluginDir: {
+        var fromUrl = root.pathFromFileUrl(Qt.resolvedUrl("."))
+        if (fromUrl)
+            return fromUrl
         var dir = (manifest && manifest.__sourceDir) ? String(manifest.__sourceDir) : ""
         return dir.replace(/\/$/, "")
     }
@@ -99,8 +118,10 @@ Item {
     }
 
     function applyConfig(forceDefaults) {
-        if (!root.pluginDir)
+        if (!root.pluginDir) {
+            console.log("owww: plugin directory is unknown; watcher not started")
             return
+        }
         var sig = forceDefaults ? "missing" : root.signatureFor(shellConfigFile.text())
         if (sig === null) {
             if (!root.appliedSignature) {

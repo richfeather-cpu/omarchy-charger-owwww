@@ -65,6 +65,34 @@ header=$(od -An -t x1 -N 12 "$ROOT/sounds/owww-tts.wav" | tr -s ' ')
 assert_contains "bundled clip is a RIFF WAVE" "$header" "52 49 46 46"
 assert_contains "bundled clip has a WAVE tag" "$header" "57 41 56 45"
 
+# --- service locates its own directory --------------------------------------
+# Installed third-party manifests have no __sourceDir. The QML has to derive
+# the plugin root from its own file URL so bin/owww and the bundled sound
+# still resolve. No Qt runtime here, so this is a static check of Service.qml.
+service_qml=$(cat "$ROOT/Service.qml")
+assert_contains "Service.qml resolves its directory from the component URL" \
+    "$service_qml" 'Qt.resolvedUrl(".")'
+assert_contains "Service.qml strips the file:// prefix" "$service_qml" 'file://'
+assert_contains "Service.qml URL-decodes the component path" \
+    "$service_qml" "decodeURIComponent"
+assert_contains "watcher launches bin/owww from pluginDir" \
+    "$service_qml" 'root.pluginDir + "/bin/owww"'
+assert_contains "watcher passes pluginDir as OWWW_PLUGIN_DIR" \
+    "$service_qml" "OWWW_PLUGIN_DIR: root.pluginDir"
+dir_block=$(awk '
+    /readonly property string pluginDir:/ { grab=1 }
+    grab { print }
+    grab && /^    }/ { exit }
+' "$ROOT/Service.qml")
+url_line=$(printf '%s\n' "$dir_block" | grep -n 'Qt.resolvedUrl' | head -1 | cut -d: -f1)
+src_line=$(printf '%s\n' "$dir_block" | grep -n '__sourceDir' | head -1 | cut -d: -f1)
+if [[ -n "${url_line}" && -n "${src_line}" && "$url_line" -lt "$src_line" ]]; then
+    ok "pluginDir consults __sourceDir only after the file URL"
+else
+    not_ok "pluginDir consults __sourceDir only after the file URL" \
+        "url line=${url_line:-missing} __sourceDir line=${src_line:-missing}"
+fi
+
 # --- transitions ------------------------------------------------------------
 transition=$(
     prev=""
