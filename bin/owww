@@ -1,0 +1,408 @@
+#!/usr/bin/env bash
+# owww: play a short sound when the charger is plugged in.
+# Silent on unplug and on the first reading (startup, and every restart).
+#
+# Copyright (c) 2026 Rich Feather
+# Licensed under the MIT License. See the LICENSE file in this repo.
+#
+# The Omarchy shell starts this when the service plugin is enabled and
+# stops it when the plugin is disabled or removed. You can also run it
+# yourself. Settings, first match wins:
+#   1. Env vars: OWWW_SOUND, OWWW_VOLUME, OWWW_DEBOUNCE, OWWW_POLL
+#   2. Inline keys on this plugin's entry in ~/.config/omarchy/shell.json
+#   3. Built-in defaults (bundled TTS clip, volume 1.0, debounce 5s, poll 10s)
+#
+# Other env:
+#   OWWW_PLUGIN_DIR       plugin root (default: parent of this script)
+#   OWWW_SHELL_CONFIG     shell.json path (default: $XDG_CONFIG_HOME/omarchy/shell.json)
+#   OWWW_POWER_SUPPLY     sysfs power_supply directory (default: /sys/class/power_supply)
+#   OWWW_DRYRUN=1         print the sound path instead of playing
+#   OWWW_NO_UDEV=1        do not start udevadm; poll only
+
+set -u
+set -o pipefail
+
+PLUGIN_ID="io.github.richfeather-cpu.omarchy-owww"
+
+SOUND=""
+VOLUME="1.0"
+DEBOUNCE=5
+POLL=10
+DRYRUN="${OWWW_DRYRUN:-0}"
+prev=""
+last_play=0
+udev_pid=""
+
+plugin_dir() {
+    if [[ -n "${OWWW_PLUGIN_DIR:-}" ]]; then
+        printf '%s\n' "$OWWW_PLUGIN_DIR"
+        return
+    fi
+    (cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+}
+
+default_sound() {
+    printf '%s\n' "$(plugin_dir)/sounds/owww-tts.wav"
+}
+
+shell_config_path() {
+    if [[ -n "${OWWW_SHELL_CONFIG:-}" ]]; then
+        printf '%s\n' "$OWWW_SHELL_CONFIG"
+        return
+    fi
+    printf '%s\n' "${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/shell.json"
+}
+
+power_supply_root() {
+    printf '%s\n' "${OWWW_POWER_SUPPLY:-/sys/class/power_supply}"
+}
+
+expand_home() {
+    local path="$1"
+    if [[ "$path" == "~" ]]; then
+        printf '%s\n' "$HOME"
+    elif [[ "$path" == "~/"* ]]; then
+        printf '%s\n' "$HOME/${path:2}"
+    else
+        printf '%s\n' "$path"
+    fi
+}
+
+# Prints sound, volume, debounce, and poll separated by ASCII unit separators.
+# Empty fields mean "not set". Returns 1 when the file cannot be used.
+read_plugin_settings() {
+    local config="$1"
+    if [[ ! -f "$config" ]]; then
+        if [[ -n "${OWWW_SHELL_CONFIG:-}" ]]; then
+            echo "owww: settings file not found: $config; using defaults" >&2
+        fi
+        return 1
+    fi
+    if command -v jq >/dev/null 2>&1; then
+        if ! jq -e 'type == "object"' "$config" >/dev/null 2>&1; then
+            echo "owww: ignoring $config (not a JSON object); using defaults" >&2
+            return 1
+        fi
+        local parsed
+        if ! parsed=$(jq -r --arg id "$PLUGIN_ID" '
+            ([.plugins[]? | select(type == "object" and .id == $id)] | first) // {}
+            | def s(k):
+                if has(k) and .[k] != null then (.[k] | tostring) else "" end;
+            [s("sound"), s("volume"), s("debounce"), s("poll")] | join("\u001f")
+        ' "$config"); then
+            echo "owww: could not read $config; using defaults" >&2
+            return 1
+        fi
+        printf '%s\n' "$parsed"
+        return 0
+    fi
+    if command -v python3 >/dev/null 2>&1; then
+        python3 - "$config" "$PLUGIN_ID" <<'PY'
+import json, sys
+path, pid = sys.argv[1], sys.argv[2]
+try:
+    with open(path, encoding="utf-8") as fh:
+        cfg = json.load(fh)
+except Exception:
+    print(f"owww: ignoring {path} (not a JSON object); using defaults", file=sys.stderr)
+    sys.exit(1)
+if not isinstance(cfg, dict):
+    print(f"owww: ignoring {path} (not a JSON object); using defaults", file=sys.stderr)
+    sys.exit(1)
+entry = {}
+plugins = cfg.get("plugins")
+if isinstance(plugins, list):
+    for item in plugins:
+        if isinstance(item, dict) and item.get("id") == pid:
+            entry = item
+            break
+def show(key):
+    if key not in entry or entry[key] is None:
+        return ""
+    return str(entry[key])
+print("\x1f".join(show(key) for key in ("sound", "volume", "debounce", "poll")))
+PY
+        return $?
+    fi
+    echo "owww: jq or python3 is required to read $config; using defaults" >&2
+    return 1
+}
+
+apply_volume() {
+    local raw="$1"
+    if [[ -z "$raw" ]]; then
+        VOLUME="1.0"
+        return
+    fi
+    if [[ ! "$raw" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+        echo "owww: invalid volume '$raw'; using 1.0" >&2
+        VOLUME="1.0"
+        return
+    fi
+    if command -v awk >/dev/null 2>&1; then
+        if awk -v v="$raw" 'BEGIN { exit !(v+0 > 2) }'; then
+            echo "owww: volume '$raw' is above 2; using 1.0" >&2
+            VOLUME="1.0"
+            return
+        fi
+    fi
+    VOLUME="$raw"
+}
+
+apply_debounce() {
+    local raw="$1"
+    if [[ -z "$raw" ]]; then
+        DEBOUNCE=5
+        return
+    fi
+    if [[ ! "$raw" =~ ^[0-9]+$ ]] || (( raw > 86400 )); then
+        echo "owww: invalid debounce '$raw'; using 5" >&2
+        DEBOUNCE=5
+        return
+    fi
+    DEBOUNCE=$raw
+}
+
+apply_poll() {
+    local raw="$1"
+    if [[ -z "$raw" ]]; then
+        POLL=10
+        return
+    fi
+    if [[ ! "$raw" =~ ^[0-9]+$ ]] || (( raw < 1 || raw > 86400 )); then
+        echo "owww: invalid poll '$raw'; using 10" >&2
+        POLL=10
+        return
+    fi
+    POLL=$raw
+}
+
+load_config() {
+    local config file_sound="" file_volume="" file_debounce="" file_poll="" line
+    config=$(shell_config_path)
+    if line=$(read_plugin_settings "$config"); then
+        IFS=$'\x1f' read -r file_sound file_volume file_debounce file_poll <<<"$line"
+    fi
+
+    local chosen_sound="${OWWW_SOUND:-}"
+    if [[ -z "$chosen_sound" ]]; then
+        chosen_sound="$file_sound"
+    fi
+    if [[ -z "$chosen_sound" ]]; then
+        SOUND=$(default_sound)
+    else
+        SOUND=$(expand_home "$chosen_sound")
+    fi
+
+    local chosen_volume="${OWWW_VOLUME:-}"
+    [[ -n "$chosen_volume" ]] || chosen_volume="$file_volume"
+    apply_volume "$chosen_volume"
+
+    local chosen_debounce="${OWWW_DEBOUNCE:-}"
+    [[ -n "$chosen_debounce" ]] || chosen_debounce="$file_debounce"
+    apply_debounce "$chosen_debounce"
+
+    local chosen_poll="${OWWW_POLL:-}"
+    [[ -n "$chosen_poll" ]] || chosen_poll="$file_poll"
+    apply_poll "$chosen_poll"
+}
+
+# A supply counts when it is a wall adapter or a USB/wireless source that is
+# actually feeding the machine (online=1). Batteries and UPS units do not.
+# Classic adapter names still count when the kernel leaves type unset.
+is_charger_supply() {
+    local dir="$1" base type=""
+    [[ -d "$dir" ]] || return 1
+    base=$(basename -- "$dir")
+    if [[ -r "$dir/type" ]]; then
+        type=$(tr -d '[:space:]' < "$dir/type" 2>/dev/null || true)
+    fi
+    case "$type" in
+        Mains|USB|USB_DCP|USB_CDP|USB_ACA|USB_C|USB_PD|USB_PD_DRP|BrickID|Wireless)
+            return 0
+            ;;
+    esac
+    [[ "$base" =~ ^(AC|AC0|ACAD|ADP[0-9]*)$ ]]
+}
+
+supply_online() {
+    local dir="$1" value=""
+    [[ -r "$dir/online" ]] || { echo 0; return; }
+    value=$(tr -d '[:space:]' < "$dir/online" 2>/dev/null || true)
+    if [[ "$value" == 1 ]]; then
+        echo 1
+    else
+        echo 0
+    fi
+}
+
+# 1 when any charger supply is online, else 0. One offline AC node must not
+# hide another port (a laptop can have AC offline and a USB-C supply online).
+ac_online() {
+    local root d any=0
+    root=$(power_supply_root)
+    [[ -d "$root" ]] || { echo 0; return; }
+    for d in "$root"/*; do
+        [[ -e "$d" ]] || continue
+        [[ -d "$d" ]] || continue
+        is_charger_supply "$d" || continue
+        if [[ "$(supply_online "$d")" == 1 ]]; then
+            any=1
+            break
+        fi
+    done
+    echo "$any"
+}
+
+paplay_volume() {
+    if ! command -v awk >/dev/null 2>&1; then
+        echo 65536
+        return
+    fi
+    awk -v v="$VOLUME" 'BEGIN {
+        if (v < 0) v = 0
+        if (v > 2) v = 2
+        printf "%d\n", int(v * 65536 + 0.5)
+    }'
+}
+
+play_owww() {
+    local played=1
+    if [[ "$DRYRUN" == 1 ]]; then
+        echo "[dry-run] would play $SOUND"
+        return 0
+    fi
+    if [[ ! -r "$SOUND" ]]; then
+        echo "sound file missing: $SOUND" >&2
+        return 0
+    fi
+    if command -v pw-play >/dev/null 2>&1; then
+        pw-play --volume "$VOLUME" "$SOUND" >/dev/null 2>&1 && played=0
+    fi
+    if (( played != 0 )) && command -v paplay >/dev/null 2>&1; then
+        paplay --volume "$(paplay_volume)" "$SOUND" >/dev/null 2>&1 && played=0
+    fi
+    if (( played != 0 )); then
+        echo "owww: could not play $SOUND (tried pw-play, then paplay)" >&2
+    fi
+    return 0
+}
+
+# handle_state <0|1> [now]
+# The first reading only records state, so startup and a settings restart
+# never play. A later 0 -> 1 plays, unless one already played within DEBOUNCE.
+handle_state() {
+    local cur="$1" now="${2:-$(date +%s)}"
+    if [[ -z "$prev" ]]; then
+        prev="$cur"
+        return 0
+    fi
+    if [[ "$prev" == 0 && "$cur" == 1 ]]; then
+        if (( now - last_play >= DEBOUNCE )); then
+            echo "charger plugged in -> owww"
+            last_play=$now
+            if [[ "$DRYRUN" == 1 ]]; then
+                play_owww
+            else
+                play_owww &
+            fi
+        else
+            echo "charger plugged in (debounced)"
+        fi
+    elif [[ "$prev" == 1 && "$cur" == 0 ]]; then
+        echo "charger unplugged"
+    fi
+    prev="$cur"
+}
+
+simulate() {
+    DRYRUN=1
+    local t=1000 s
+    echo "simulating: start=1, then 0,1 (play), 0,1 within 2s (debounced), wait, 0,1 (play), 1 (no-op)"
+    for s in "1:$t" "0:$((t + 10))" "1:$((t + 20))" "0:$((t + 21))" "1:$((t + 22))" "0:$((t + 40))" "1:$((t + 50))" "1:$((t + 51))"; do
+        printf '  state=%s t=%s: ' "${s%%:*}" "${s##*:}"
+        handle_state "${s%%:*}" "${s##*:}"
+        echo
+    done
+}
+
+cleanup() {
+    local pid="${udev_pid:-}"
+    udev_pid=""
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+        kill "$pid" 2>/dev/null || true
+        wait "$pid" 2>/dev/null || true
+    fi
+}
+
+# SIGTERM is how the shell stops the watcher on disable. Exit cleanly so it
+# is not treated as a crash. udevadm dying on its own still exits 1.
+on_signal() {
+    cleanup
+    exit 0
+}
+
+run_watcher() {
+    local have_udev=0 line rc
+    trap on_signal INT TERM
+    trap cleanup EXIT
+    if [[ "${OWWW_NO_UDEV:-0}" != 1 ]] && command -v udevadm >/dev/null 2>&1; then
+        # Keep udevadm's pid so disable/stop can reap it with this script.
+        exec 3< <(exec udevadm monitor --udev --subsystem-match=power_supply)
+        udev_pid=$!
+        have_udev=1
+    elif [[ "${OWWW_NO_UDEV:-0}" != 1 ]]; then
+        echo "owww: udevadm not found; polling every ${POLL}s" >&2
+    fi
+
+    handle_state "$(ac_online)"
+    echo "owww: watching; AC online=$prev"
+
+    while true; do
+        if (( have_udev )); then
+            if read -r -t "$POLL" -u 3 line; then
+                [[ "$line" == *power_supply* ]] || continue
+                sleep 0.3
+            else
+                rc=$?
+                if (( rc > 128 )); then
+                    :
+                else
+                    echo "owww: udevadm monitor exited" >&2
+                    exit 1
+                fi
+            fi
+        else
+            sleep "$POLL"
+        fi
+        handle_state "$(ac_online)"
+    done
+}
+
+main() {
+    load_config
+    case "${1:-}" in
+        --simulate)
+            simulate
+            ;;
+        --play)
+            play_owww
+            wait
+            ;;
+        --status)
+            printf 'sound=%s\nvolume=%s\ndebounce=%s\npoll=%s\nac=%s\n' \
+                "$SOUND" "$VOLUME" "$DEBOUNCE" "$POLL" "$(ac_online)"
+            ;;
+        "")
+            run_watcher
+            ;;
+        *)
+            echo "usage: owww [--simulate|--play|--status]" >&2
+            exit 2
+            ;;
+    esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

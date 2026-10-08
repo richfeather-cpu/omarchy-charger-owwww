@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.richfeather-cpu.omarchy-owww",
+  "name": "Owww",
+  "version": "1.0.0",
+  "author": "Rich Feather",
+  "license": "MIT",
+  "description": "Plays a short owww when the charger is plugged in.",
+  "kinds": ["service"],
+  "entryPoints": {
+    "service": "Service.qml"
+  }
+}
